@@ -1,0 +1,13 @@
+[Unit]
+Description=Internet Forwarding Service (Kali → AP)
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/home/agent/net_forwarding/setup.sh
+ExecStop=/home/agent/net_forwarding/stop.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

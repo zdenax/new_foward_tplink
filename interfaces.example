@@ -1,0 +1,11 @@
+# Příklad konfigurace /etc/network/interfaces
+# Pro statické IP na eth0 (připojení k AP)
+
+auto eth0
+iface eth0 inet static
+    address 192.168.100.50
+    netmask 255.255.255.0
+    gateway 192.168.100.1
+
+# wlan0 by měl být nakonfigurován pro internet
+# (obvykle přes NetworkManager nebo jiný DHCP)
