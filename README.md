@@ -158,3 +158,6 @@ sudo systemctl start net-forwarding
 - `stop.sh` - Zastavení forwardingu
 - `net-forwarding.service` - Systemd service (volitelně)
 - `README.md` - Tato dokumentace
+
+---
+vault: [[Vault/School/ZPS]]

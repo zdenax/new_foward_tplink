@@ -114,3 +114,6 @@ sudo iptables -t nat -L POSTROUTING -v
 
 ---
 **Poznámka:** Problem byl v NetworkManageru, který automaticky vytvořil eth1. Při budoucích setupech zkontroluj `nmcli connection show` a ujisti se, že není duplikovaný ethernet connection.
+
+---
+vault: [[Vault/School/ZPS]]
