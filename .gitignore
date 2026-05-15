@@ -1,0 +1,5 @@
+webui/config.local.py
+*.local.py
+webui/aliases.json
+__pycache__/
+webui/__pycache__/
