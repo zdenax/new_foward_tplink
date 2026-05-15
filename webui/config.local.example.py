@@ -1,0 +1,5 @@
+AP_IP = "192.168.100.2"
+AP_ADMIN_USER = "admin"
+AP_ADMIN_PASS = "admin"
+WAN_IF = "wlan0"
+LAN_IF = "eth0"

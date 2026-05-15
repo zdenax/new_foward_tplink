@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+import subprocess, json, os, re, time, base64
+from pathlib import Path
+from flask import Flask, render_template, jsonify, request
+import urllib.request, urllib.error
+
+app = Flask(__name__)
+
+SCRIPT_DIR = Path(__file__).parent.parent
+SETUP_SCRIPT = SCRIPT_DIR / "setup.sh"
+STOP_SCRIPT  = SCRIPT_DIR / "stop.sh"
+DNSMASQ_LEASES = Path("/var/lib/dnsmasq/dnsmasq.leases")
+
+AP_IP = "192.168.100.2"
+AP_ADMIN_USER = "admin"
+AP_ADMIN_PASS = "admin"
+WAN_IF = "wlan0"
+LAN_IF = "eth0"
+
+ALIASES_FILE = Path(__file__).parent / "aliases.json"
+
+try:
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location("config_local",
+        Path(__file__).parent / "config.local.py")
+    cfg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cfg)
+    AP_IP = getattr(cfg, "AP_IP", AP_IP)
+    AP_ADMIN_USER = getattr(cfg, "AP_ADMIN_USER", AP_ADMIN_USER)
+    AP_ADMIN_PASS = getattr(cfg, "AP_ADMIN_PASS", AP_ADMIN_PASS)
+    WAN_IF = getattr(cfg, "WAN_IF", WAN_IF)
+    LAN_IF = getattr(cfg, "LAN_IF", LAN_IF)
+except Exception:
+    pass
+
+
+def run(cmd):
+    try:
+        return subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ""
+
+def forwarding_active():
+    return run("cat /proc/sys/net/ipv4/ip_forward") == "1"
+
+def get_iface_stats(iface):
+    try:
+        with open(f"/sys/class/net/{iface}/statistics/rx_bytes") as f:
+            rx = int(f.read())
+        with open(f"/sys/class/net/{iface}/statistics/tx_bytes") as f:
+            tx = int(f.read())
+        return rx, tx
+    except Exception:
+        return 0, 0
+
+def fmt_bytes(b):
+    for unit in ["B", "KB", "MB", "GB"]:
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+def get_iface_ip(iface):
+    out = run(f"ip addr show {iface}")
+    m = re.search(r"inet (\S+)", out)
+    return m.group(1) if m else ""
+
+def get_iface_state(iface):
+    state = run(f"cat /sys/class/net/{iface}/operstate 2>/dev/null")
+    return state or "unknown"
+
+def load_aliases():
+    try:
+        return json.loads(ALIASES_FILE.read_text())
+    except Exception:
+        return {}
+
+def save_aliases(aliases):
+    ALIASES_FILE.write_text(json.dumps(aliases, ensure_ascii=False, indent=2))
+
+def ap_auth_header():
+    cred = base64.b64encode(f"{AP_ADMIN_USER}:{AP_ADMIN_PASS}".encode()).decode()
+    return {"Cookie": f"Authorization=Basic {cred}", "Referer": f"http://{AP_IP}/"}
+
+def ap_cgi(action_type, oid, stack, attrs):
+    attr_str = "\r\n".join(attrs) + "\r\n"
+    count = len(attrs)
+    data = f"[{oid}#{stack}#0,0,0,0,0,0]0,{count}\r\n{attr_str}".encode()
+    url = f"http://{AP_IP}/cgi?{action_type}="
+    req = urllib.request.Request(url, data=data, headers=ap_auth_header(), method="POST")
+    req.add_header("Content-Type", "text/plain")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.read().decode(errors="ignore")
+
+def ap_get_hosts():
+    try:
+        resp = ap_cgi(5, "LAN_HOST_ENTRY", "0,0,0,0,0,0", ["IPAddress", "MACAddress", "HostName"])
+        hosts = {}
+        for block in resp.split("["):
+            ip_m = re.search(r"IPAddress=(\S+)", block)
+            h_m  = re.search(r"hostName=(.+)", block)
+            if ip_m and h_m:
+                hn = h_m.group(1).strip()
+                if hn and hn.lower() not in ("unknown", ""):
+                    hosts[ip_m.group(1)] = hn
+        return hosts
+    except Exception:
+        return {}
+
+def get_clients():
+    aliases = load_aliases()
+    ap_hosts = ap_get_hosts()
+    clients = []
+    out = run(f"ip neigh show dev {LAN_IF}")
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "lladdr" and "FAILED" not in line:
+            ip, mac = parts[0], parts[2]
+            if ip == AP_IP:
+                continue
+            name = aliases.get(ip) or aliases.get(mac) or ap_hosts.get(ip) or ""
+            clients.append({"ip": ip, "mac": mac, "name": name})
+    return clients
+
+def ap_get_wlan_full():
+    resp = ap_cgi(5, "LAN_WLAN", "0,0,0,0,0,0", ["name", "SSID", "Enable", "X_TP_PreSharedKey"])
+    stack_m = re.search(r"\[(\d+,\d+,\d+,\d+,\d+,\d+)\]", resp)
+    ssid_m  = re.search(r"SSID=(.+)", resp)
+    psk_m   = re.search(r"X_TP_PreSharedKey=(.+)", resp)
+    stack = stack_m.group(1) if stack_m else "1,1,0,0,0,0"
+    ssid  = ssid_m.group(1).strip() if ssid_m else ""
+    psk   = psk_m.group(1).strip()  if psk_m  else ""
+    return stack, ssid, psk
+
+def ap_get_wlan():
+    stack, ssid, _ = ap_get_wlan_full()
+    return stack, ssid
+
+def get_ap_config():
+    try:
+        req = urllib.request.Request(f"http://{AP_IP}/", headers=ap_auth_header())
+        with urllib.request.urlopen(req, timeout=2) as r:
+            html = r.read().decode(errors="ignore")
+        m = re.search(r'modelName="([^"]+)"', html)
+        model = m.group(1) if m else "TP-Link AP"
+        _, ssid, psk = ap_get_wlan_full()
+        return {"model": model, "ssid": ssid, "password": psk, "reachable": True}
+    except Exception:
+        return {"model": "", "ssid": "", "password": "", "reachable": False}
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/api/status")
+def api_status():
+    wan_rx, wan_tx = get_iface_stats(WAN_IF)
+    lan_rx, lan_tx = get_iface_stats(LAN_IF)
+    return jsonify({
+        "forwarding": forwarding_active(),
+        "wan": {
+            "iface": WAN_IF,
+            "ip": get_iface_ip(WAN_IF),
+            "state": get_iface_state(WAN_IF),
+            "rx": fmt_bytes(wan_rx),
+            "tx": fmt_bytes(wan_tx),
+        },
+        "lan": {
+            "iface": LAN_IF,
+            "ip": get_iface_ip(LAN_IF),
+            "state": get_iface_state(LAN_IF),
+            "rx": fmt_bytes(lan_rx),
+            "tx": fmt_bytes(lan_tx),
+        },
+        "clients": get_clients(),
+        "ap": get_ap_config(),
+    })
+
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    result = subprocess.run(["sudo", str(SETUP_SCRIPT)], capture_output=True, text=True)
+    ok = result.returncode == 0
+    return jsonify({"ok": ok, "output": result.stdout + result.stderr})
+
+@app.route("/api/stop", methods=["POST"])
+def api_stop():
+    result = subprocess.run(["sudo", str(STOP_SCRIPT)], capture_output=True, text=True)
+    ok = result.returncode == 0
+    return jsonify({"ok": ok, "output": result.stdout + result.stderr})
+
+@app.route("/api/ap/wifi", methods=["POST"])
+def api_ap_wifi():
+    data = request.get_json()
+    ssid = data.get("ssid", "").strip()
+    password = data.get("password", "")
+    if not ssid:
+        return jsonify({"ok": False, "error": "SSID nesmí být prázdné"})
+    if password and len(password) < 8:
+        return jsonify({"ok": False, "error": "Heslo musí mít min. 8 znaků"})
+    try:
+        stack, _ = ap_get_wlan()
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"Nelze číst AP: {e}"})
+    try:
+        ap_cgi(2, "LAN_WLAN", stack, [f"SSID={ssid}"])
+    except (urllib.error.URLError, TimeoutError):
+        pass
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"SSID SET selhal: {e}"})
+    if password:
+        try:
+            ap_cgi(2, "LAN_WLAN", stack, [f"X_TP_PreSharedKey={password}"])
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        except Exception as e:
+            return jsonify({"ok": False, "error": f"Heslo SET selhal: {e}"})
+    return jsonify({"ok": True})
+
+@app.route("/api/aliases", methods=["GET"])
+def api_aliases_get():
+    return jsonify(load_aliases())
+
+@app.route("/api/aliases", methods=["POST"])
+def api_aliases_set():
+    data = request.get_json()
+    key = data.get("key", "").strip()
+    name = data.get("name", "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "key required"})
+    aliases = load_aliases()
+    if name:
+        aliases[key] = name
+    else:
+        aliases.pop(key, None)
+    save_aliases(aliases)
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=8080, debug=False)
