@@ -161,4 +161,3 @@ sudo systemctl start net-forwarding
 
 ---
 vault: [[Vault/School/ZPS]]
-# wifi-foward-lan--AP
